@@ -1,0 +1,13 @@
+[project]
+name = "ukwiki-patrol"
+version = "0.1.0"
+description = "Revert-risk scoring for Ukrainian Wikipedia patrol"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["ruff>=0.14", "pre-commit>=4"]
+
+[tool.ruff]
+line-length = 100
