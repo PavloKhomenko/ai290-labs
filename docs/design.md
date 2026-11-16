@@ -448,7 +448,18 @@ and pgvector on RDS for ≈ 200 USD/month; that trade-off is kept as an alternat
 
 ### 7.2 Experiment results
 
-Placeholder: filled in Lab 2 (baseline, candidate, data versions, MLflow run links).
+Lab 2, MLflow experiment `ukwiki-patrol`, data `f4cbadfd0ac13f6c59cc285096808665.dir`
+(`data/features`, feature_version v1), commit `b14ec8c`. Test 2026-10-07 – 10-11: 13,810 edits, 132 reverted (random PR-AUC ≈ 0.010).
+
+| Run | MLflow run id | PR-AUC | capture@10% | recall@P0.30 |
+|---|---|---|---|---|
+| rule baseline (3 rules) | `4d3607f44a9f4f1685c5dcec47f41eaf` | 0.063 | 0.505 | 0.038 |
+| LightGBM, metadata features | `7ad16291775f40b8a7fd586fd1f38b25` (registered v2, `champion`) | **0.120** | **0.762** | 0.008 |
+| LightGBM, reproduced by `make reproduce` | `210fe2d8c1b6459c96e785004a184e0c` | 0.120 | 0.762 | 0.008 |
+
+LightGBM beats the rule on both ranking metrics and passes the "rule + 0.05" part of the model
+target in section 3, but not the absolute PR-AUC ≥ 0.25; that target stays an **Assumption** until
+text features and the dumps are added. Neither model reaches precision 0.30 at useful recall.
 
 ### 7.3 Performance benchmarks
 
