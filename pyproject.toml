@@ -16,6 +16,7 @@ dependencies = [
     "requests>=2.32",
     "scikit-learn>=1.6",
     "sqlalchemy>=2.0",
+    "sentence-transformers>=5",
 ]
 
 [dependency-groups]

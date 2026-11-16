@@ -20,7 +20,7 @@ services:
              for b in dvc mlflow; do aws --endpoint-url http://minio:9000 s3 mb s3://$$b || true; done"
 
   postgres:
-    image: postgres:16
+    image: pgvector/pgvector:0.8.7-pg16-trixie  # PostgreSQL 16 + pgvector (Lab 3 vector store)
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}

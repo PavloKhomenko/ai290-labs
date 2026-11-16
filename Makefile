@@ -1,7 +1,7 @@
 -include .env
 export
 
-.PHONY: setup lint up down data-version data-pull train promote reproduce
+.PHONY: setup lint up down data-version data-pull train promote reproduce corpus index llm-baseline rag-eval
 
 setup:
 	[ -f .env ] || cp .env.example .env
@@ -33,3 +33,16 @@ promote:
 
 reproduce:
 	uv run python -m ukwiki_patrol.reproduce $(RUN_ID)
+
+# Lab 3: LLM component. Settings live in configs/llm.yaml; SET="key=value ..." overrides one run.
+corpus:
+	uv run python -m ukwiki_patrol.llm.corpus
+
+index:
+	uv run python -m ukwiki_patrol.llm.rag index $(addprefix --set ,$(SET))
+
+llm-baseline:
+	uv run python -m ukwiki_patrol.llm.evaluate --closed-book
+
+rag-eval:
+	uv run python -m ukwiki_patrol.llm.evaluate $(addprefix --set ,$(SET))
