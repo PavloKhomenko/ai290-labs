@@ -1,0 +1,3 @@
+CREATE DATABASE warehouse;
+CREATE DATABASE mlflow;
+CREATE DATABASE airflow;

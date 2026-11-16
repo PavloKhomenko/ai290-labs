@@ -1,13 +1,32 @@
 [project]
 name = "ukwiki-patrol"
-version = "0.1.0"
+version = "0.2.0"
 description = "Revert-risk scoring for Ukrainian Wikipedia patrol"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "dvc[s3]==3.67.1",
+    "dvc-s3==3.3.0",
+    "lightgbm>=4.6",
+    "mlflow==3.16.1",
+    "pandas>=2.2",
+    "psycopg2-binary>=2.9",
+    "pyarrow>=17",
+    "pyyaml>=6",
+    "requests>=2.32",
+    "scikit-learn>=1.6",
+    "sqlalchemy>=2.0",
+]
 
 [dependency-groups]
 dev = ["ruff>=0.14", "pre-commit>=4"]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ukwiki_patrol"]
+
 [tool.ruff]
-line-length = 100
+line-length = 110

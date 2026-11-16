@@ -104,79 +104,95 @@ consumer needs an order, not a duration.
 
 | Source | What | Arrival | Used for |
 |---|---|---|---|
-| recentchanges API (uk.wikipedia.org) | edit metadata, tags incl. `mw-reverted` | live; the API keeps ~30 days | daily ingestion, labels for recent days, serving input |
-| compare API | diff between a revision and its parent | per edit, on request | added/removed text at training and serving |
-| list=users API | registration date, groups | per user, on request | account age at serving |
-| MediaWiki History dumps (dumps.wikimedia.org) | full edit history with precomputed identity-revert labels and causal user counters | monthly snapshot, ~first week of the month; last two snapshots kept upstream | training history 2024-01 onwards |
-| Wikipedia policy pages (uk), CC BY-SA 4.0 | text of patrol, vandalism, neutrality, verifiability and copyright policies | refreshed monthly | Lab 3 retrieval corpus |
+| recentchanges API (uk.wikipedia.org) | edit metadata, tags incl. `mw-reverted` | live; the API keeps exactly 30 days | daily batch (Lab 2), labels, serving input |
+| list=users API | registration date | per user, in the same batch | `account_age_days` |
+| compare API | diff between a revision and its parent | per edit, on request | on demand only: `/score`, Lab 3 explanations, Lab 5 agent; not in the daily batch |
+| MediaWiki History dumps (dumps.wikimedia.org) | full edit history with identity-revert labels and as-of-edit user counters | monthly snapshot | **deferred**: not loaded in Lab 2; needed once the model must train on more than the 30-day API window |
+| Wikipedia policy pages (uk), CC BY-SA 4.0 | patrol, vandalism, neutrality, verifiability and copyright policies | refreshed monthly | Lab 3 retrieval corpus |
 
-**Labels and their delay.** Label = edit reverted within 7 days. Two definitions exist:
-`mw-reverted` tag (API, includes manual reverts) and identity revert (dumps, sha1 match).
-Lab 2 measures their overlap on common dates and keeps the source in a `label_definition`
-column. Observed delay: median 0.07 h to 2.5 h per day, one day with 18 h; the tail decides the
-maturity window. Labels for the last 7 days are incomplete: 2026-10-17 and 2026-10-18 have the
-highest edit counts and the lowest revert counts of the window (20 and 17), which is right-
-censoring, not a quiet weekend.
+**What Lab 2 ingests.** The Airflow DAG `ukwiki_daily` collects one **UTC day per run** (batch grain:
+a day, keyed on `data_interval_start`) into `data/raw/date=YYYY-MM-DD/edits.parquet`. Collected:
+2026-09-20 to 2026-10-18, 29 partitions, **79,159 edits, 1,226 reverted (1.55%)**, 2,171–3,606
+edits per day. 2026-09-19 is incomplete because the API window had already passed its start.
+User names are hashed in `extract`, so raw partitions hold no names (6.5).
 
+**Data version in use.** DVC tracks `data/raw` (md5 `b0437d6f298a142d3c052d44766faccf.dir`) and
+`data/features` (md5 `f4cbadfd0ac13f6c59cc285096808665.dir`), remote `s3://dvc` on MinIO. Every
+MLflow run records the `data/features` md5 it read as `data_hash`.
+
+**Labels and their delay.** Label = the edit carries `mw-reverted` (includes manual reverts).
+A row's label counts as final when it was collected ≥ 7 days after the edit (`label_mature`); on
+the first collection, days from 2026-10-12 on are immature and are refreshed by re-running their
+intervals. Measured delay, for the 889 reverts whose revert edit falls in the same daily batch:
+median 0.23 h, p90 3.5 h, p99 11.8 h, max 21 h. Reverts that cross midnight are not timed by a
+daily batch, so the tail is underestimated; the 7-day window stays an **Assumption** with a wide
+margin over the observed 21 h. The identity-revert definition arrives with the dumps (deferred).
+
+**Serving time versus training time.** At serving time only the edit itself, the editor's
+registration date and counters kept in PostgreSQL exist. Anything known later (reverts, future
+edit counts, page deletion) is never a feature; see the source column in 5.3.
 
 **Checklist justification**
 
-- **A time axis.** Every edit has a second-precision timestamp. Lab 2 ingests "the next day"
-  from the API and "the next month" from the dumps; drift can be emulated by replaying history
-  week by week, and real drift exists (temporary accounts, vandal waves).
-- **Enough history to hold out a period.** History dumps from 2024-01 to 2026-08 (32 months,
-  ≈ 2.5 M edits at the observed rate, **Assumption** until loaded) plus the rolling API window.
-  Held out: 2026-07-08 to 2026-08-31 as test, see 5.4.
-- **Labels with a known arrival delay.** Yes: median about an hour, final after 7 days
-  (**Assumption**, measured in Lab 2). Lab 4 monitors inputs and scores during the 7 days and
-  label metrics afterwards.
-- **A text surface or a documented corpus.** Both: the added and removed text of each edit is
-  the data itself, and the Ukrainian Wikipedia policy pages are the retrieval corpus for Lab 3.
+- **A time axis.** Every edit has a second-precision timestamp; one run ingests "the next day".
+  Real drift exists inside the window (temporary accounts, the 2026-09-28 vandal wave).
+- **Enough history to hold out a period.** 29 days, 22 of them fully matured at the first
+  collection. The last 5 matured days are held out, with a 7-day gap (5.4). Longer history
+  needs the dumps.
+- **Labels with a known arrival delay.** Yes: measured above, final after 7 days. Lab 4 monitors
+  inputs and scores during those 7 days and label metrics afterwards.
+- **A text surface or a documented corpus.** Edit text via the compare API on demand, and the
+  Ukrainian Wikipedia policy pages as the Lab 3 retrieval corpus.
 
 ### 5.3 Techniques
 
 **Baseline (rule):** score = number of triggered rules, ties broken by recency:
-(1) unregistered editor (IP or temporary account); (2) `size_delta < −500` bytes or page
-blanking tag; (3) added text with ≥ 50% uppercase letters, a character repeated ≥ 5 times, or a
-hit in a profanity lexicon; (4) empty edit summary on a non-minor edit.
-This is also the production fallback (4.2).
+(1) unregistered editor (IP or temporary account); (2) `size_delta < −500` bytes or `mw-blank`
+tag; (3) empty edit summary on a non-minor edit. A fourth rule on the added text (uppercase
+share, repeated characters, profanity) needs diffs and is deferred. This is also the production
+fallback (4.2). Code: `rule_score` in `src/ukwiki_patrol/features.py`.
 
-**Candidate:** LightGBM on tabular and text-statistics features, plus one stacked feature: the
-out-of-fold probability of a logistic regression on character 2–5-gram TF-IDF of the added text.
-Chosen for training speed on a laptop and for SHAP-based reasons in `top_features`.
+**Candidate:** LightGBM on the metadata features below, fixed hyperparameters, single-threaded
+and deterministic so a run can be reproduced exactly. Text features (added-text statistics,
+TF-IDF logistic regression) are **deferred**: they need one compare API call per edit.
 
-**Features and their serving-time source**
+**Features and their serving-time source** (`feature_version = v1`, table `features` in
+PostgreSQL, built by the `build_features` task)
 
 | Feature | Training-time source | Serving-time source |
 |---|---|---|
-| `is_unregistered` (IP or temporary account) | dumps: `event_user_is_anonymous`, `event_user_is_temporary`, `~` prefix | recentchanges row: user name prefix |
-| `account_age_days` | dumps: `event_user_registration_timestamp` | list=users at request, cached in the PostgreSQL online table |
-| `user_prior_edits` | dumps: `event_user_revision_count` (value at edit time) | PostgreSQL counter updated by `edit-poller`. **Not** the API `editcount`, which differs (see 6.9, skew) |
-| `user_revert_rate_90d` | offline aggregate over **matured** labels only, computed as of the edit time | PostgreSQL online table, refreshed daily |
-| `page_revert_rate_90d`, `page_edits_24h` | offline aggregates, computed as of the edit time | PostgreSQL online table; `page_edits_24h` updated by poller |
+| `is_unregistered` | user name: IP or `~` temporary account, at collection | recentchanges row: user name |
+| `account_age_days` | edit timestamp − registration date (list=users) | list=users at request, cached in PostgreSQL |
+| `user_prior_edits` | SQL window over `clean_edits`: earlier edits by the same `user_key` in the collected window | PostgreSQL counter updated by `edit-poller`. **Not** the API `editcount`, which includes the future (6.9) |
+| `page_edits_24h` | SQL window over `clean_edits`: edits to the page in the previous 24 h | PostgreSQL counter updated by `edit-poller` |
 | `size_delta`, `is_new_page`, `is_minor`, `hour_utc`, `weekday` | edit row | recentchanges row / request payload |
 | `comment_len`, `comment_is_auto` | edit row | recentchanges row |
-| save-time tags (whitelist: `mw-blank`, `mw-replace`, `mobile edit`, `visualeditor`, …); revert tags excluded | edit row | recentchanges row |
-| added-text stats (length, uppercase share, max char run, URLs, digits, lexicon hits, Cyrillic share) | compare API, same function as serving | compare API at request |
-| `tfidf_lr_score` | out-of-fold prediction | the same LR model, logged in MLflow with LightGBM |
+| `tag_mw_blank`, `tag_mw_replace`, `tag_mobile_edit`, `tag_visualeditor` (save-time tags; revert tags excluded) | edit row | recentchanges row |
+
+Deferred features: `user_revert_rate_90d`, `page_revert_rate_90d` (need more than 30 days of
+matured labels), added-text statistics and `tfidf_lr_score` (need diffs).
 
 ### 5.4 Experimentation and validation
 
 **Split: by time, with a gap equal to the label maturity window.** A random split would put
 the same vandal wave (2026-09-28) and the same page on both sides and would let user and page
-aggregates computed later leak backwards.
+counters computed later leak backwards.
+
+Lab 2 (API window, `src/ukwiki_patrol/train.py`): only days whose labels are all mature are used.
 
 | Part | Period | Note |
 |---|---|---|
-| train | 2024-01-01 – 2026-04-30 | history dumps |
-| gap | 7 days | no example uses a label the model could not have had |
-| validation | 2026-05-08 – 2026-06-30 | early stopping, threshold |
-| gap | 7 days | |
-| test (held out) | 2026-07-08 – 2026-08-31 | touched once per candidate |
-| recent check | 2026-09-20 onwards (API) | temporary-account era; reported separately, matured days only |
+| train | 2026-09-20 – 2026-09-29 | 10 days |
+| gap | 2026-09-30 – 2026-10-06 | 7 days: the model is trained only on labels it could have had |
+| test (held out) | 2026-10-07 – 2026-10-11 | last 5 fully matured days |
+
+No validation period yet: hyperparameters are fixed and the window is too short to spend days on
+early stopping. With the dumps (deferred) the split becomes train 2024-01 – 2026-04, validation
+2026-05 – 2026-06, test 2026-07 – 2026-08, each separated by 7 days.
 
 **Offline metric:** PR-AUC (optimizing); queue capture@10% and recall at precision 0.30
-(satisficing), each also on slices: unregistered editors, new pages.
+(satisficing). Slices (unregistered editors, new pages) are deferred until the test set has
+enough positives per slice.
 
 **Comparing a new model with the current one:** both scored on the same latest two matured weeks,
 which are excluded from the challenger's training window so neither model has seen them.
@@ -220,29 +236,28 @@ flowchart LR
     SYS <-->|"prompts / explanations"| LLM
 ```
 
-**Data flow on the seven layers.** The three required marks are the hexagons. Details of
-each step are in 5.2–5.4 and 6.6.
+**Data flow on the seven layers.** The three required marks are the two hexagons and the
+TRAINING / SERVING PATH split at the feature tables. Lab 2 builds layers 1–5; details in 5.2–5.4.
 
 ```mermaid
 flowchart TB
-    L1["1 Ingestion<br/>Airflow: daily API, monthly dumps<br/>edit-poller: every 2 min"]
-    VP{{"VERSION POINT<br/>DVC on MinIO raw"}}
-    L2["2 Preprocessing<br/>hash users, label maturity,<br/>features.py"]
-    QG{{"QUALITY GATE<br/>schema, row counts, label rate"}}
-    subgraph L3["3 Feature tables, no feature store service"]
-        OFF[("offline<br/>Parquet in MinIO")]
-        ON[("online<br/>PostgreSQL counters")]
+    L1["1 Ingestion<br/>Airflow 3.3.1 DAG ukwiki_daily: extract<br/>recentchanges API, one UTC day per run"]
+    L2["2 Preprocessing<br/>validate, transform (hash users, label maturity),<br/>load: PostgreSQL clean_edits"]
+    subgraph L3["3 Feature tables: build_features, feature_version v1"]
+        OFF[("offline<br/>Parquet data/features")]
+        ON[("online<br/>PostgreSQL features")]
     end
-    L4["4 Training<br/>Airflow train_weekly, MLflow tracking"]
-    L5["5 Registry<br/>MLflow, alias champion"]
-    L6["6 Inference<br/>patrol-api + edit-poller micro-batch"]
+    QG{{"QUALITY GATE<br/>quality_check: rows, duplicates,<br/>nulls, interval, label rate"}}
+    VP{{"VERSION POINT<br/>DVC 3.67.1: data/raw + data/features<br/>remote MinIO s3://dvc"}}
+    L4["4 Training<br/>train.py: rule + LightGBM,<br/>MLflow 3.16.1 tracking"]
+    L5["5 Registry<br/>MLflow registry ukwiki-patrol,<br/>alias champion"]
+    L6["6 Inference, Lab 4<br/>patrol-api + edit-poller micro-batch"]
     CONS["Patrollers"]
-    L7["7 Monitoring<br/>Evidently, Prometheus + Grafana"]
+    L7["7 Monitoring, Lab 4<br/>Evidently, Prometheus + Grafana"]
 
-    L1 --> VP --> L2 --> QG
-    QG --> OFF
-    QG --> ON
-    OFF -- "TRAINING PATH" --> L4 --> L5 --> L6
+    L1 --> L2 --> L3
+    L3 --> QG --> VP
+    VP -- "TRAINING PATH: offline, versioned" --> L4 --> L5 --> L6
     ON -- "SERVING PATH" --> L6
     L6 --> CONS
     L6 -- "scores, inputs" --> L7
@@ -272,15 +287,16 @@ flowchart TB
 
 ### 6.2 Infra
 
-Component names are the ones used in all three diagrams.
+Component names are the ones used in all three diagrams. Lab 2 runs MinIO, PostgreSQL, Airflow
+and MLflow with `docker-compose.yml` (`make up`); Minikube arrives in Lab 4.
 
 | Component | Local (pinned) | AWS | GCP | Azure |
 |---|---|---|---|---|
 | Object storage, data lake | MinIO-compatible `pgsty/silo:RELEASE.2026-09-16T00-00-00Z` | Amazon S3 | Cloud Storage | Blob Storage |
 | Data versioning remote | DVC 3.67.1 + dvc-s3 3.3.0, remote on MinIO | S3 remote | GCS remote | Azure Blob remote |
 | Serving database (predictions, feedback, online feature table, MLflow and Airflow metadata) | PostgreSQL 16 | Amazon RDS | Cloud SQL | Azure Database for PostgreSQL |
-| Orchestrator | Apache Airflow 3.3.1, LocalExecutor | Amazon MWAA | Cloud Composer | Azure Data Factory |
-| Experiment tracking, model registry | MLflow 3.16.1, PostgreSQL backend, MinIO artifacts | SageMaker with MLflow | Vertex AI Experiments and Model Registry | Azure ML with MLflow |
+| Orchestrator | Apache Airflow 3.3.1, LocalExecutor, `airflow standalone` | Amazon MWAA | Cloud Composer | Azure Data Factory |
+| Experiment tracking, model registry | MLflow 3.16.1 (`docker/mlflow.Dockerfile` adds psycopg2 and boto3), PostgreSQL backend, artifacts proxied to MinIO | SageMaker with MLflow | Vertex AI Experiments and Model Registry | Azure ML with MLflow |
 | Model service | `patrol-api` (FastAPI + LightGBM) | Amazon EKS | GKE | AKS |
 | Poller | `edit-poller` (Python worker) | Amazon EKS | GKE | AKS |
 | Container registry | Minikube built-in registry | Amazon ECR | Artifact Registry | Azure Container Registry |
@@ -309,13 +325,17 @@ Component names are the ones used in all three diagrams.
 
 ### 6.4 Security
 
-- **Secrets:** local `.env` (git-ignored) for MinIO, PostgreSQL and the LLM API key; Kubernetes
+- **Secrets:** local `.env` (git-ignored, created from the committed `.env.example`) for MinIO,
+  PostgreSQL, the user-hash salt and later the LLM API key. The DVC remote configuration is
+  committed without credentials; DVC and MLflow read them from the environment. Kubernetes
   Secrets from Lab 4; in the cloud column AWS Secrets Manager / Secret Manager / Key Vault.
   Wikimedia read APIs need no credentials.
 - **Who may call the service:** `patrol-api` is a ClusterIP service, reachable only inside the
   cluster and by port-forward for the demo. Callers (`edit-poller`, queue page, agent)
   authenticate with a static bearer token from a Secret. Only the owner can change MLflow
   aliases.
+- **Local stack (Lab 2):** Airflow runs with all users as admins and MLflow without
+  authentication; both are reachable only on localhost and hold no personal data.
 - **Upstream etiquette:** User-Agent with a contact address, `maxlag=5`, one request at a time,
   exponential back-off on 429/503.
 
@@ -323,10 +343,11 @@ Component names are the ones used in all three diagrams.
 
 - **Personal data:** user names; in the history dumps, IP addresses of unregistered editors
   before temporary accounts. Edit content is public under CC BY-SA 4.0.
-- **Handling:** from Lab 2, preprocessing replaces user names and IPs with a salted SHA-256 key
-  **before the version point**, so no raw identifier enters DVC, the feature tables or MLflow. The salt is a
-  secret. Raw dump files are deleted after parsing. The Lab 1 collectors still store raw names
-  in local, git-ignored files; this is known and fixed by the hashing step.
+- **Handling:** the `extract` task replaces user names (and IPs, once the dumps are loaded)
+  with a salted SHA-256 key (`user_key`, 16 hex characters) before writing anything, so no raw
+  identifier enters the raw partitions, DVC, the warehouse or MLflow. The salt is a secret in
+  `.env`; changing it breaks `user_prior_edits` continuity, so it is set once. Titles and edit
+  summaries are public and kept.
 - **Retention:** raw partitions 12 months; predictions and feedback 90 days; LLM prompts and
   traces 30 days. No profiling of individuals: per-user features are aggregates used only to
   rank edits.
@@ -345,7 +366,7 @@ First draft; Lab 4 implements it.
 | Alert | Fires when | Receiver |
 |---|---|---|
 | Ingest stale or short | rows in D-1 < 50% of the 7-day median, **or** the partition's max timestamp is not newer than the previous partition's (job re-read the same data) | project owner |
-| Quality gate failed | any check in 6.1 fails; the DAG stops before the feature tables | project owner |
+| Quality gate failed | `validate` or `quality_check` fails; the run is marked failed and the day is not versioned | project owner (Lab 2: visible in the Airflow UI; routing in Lab 4) |
 | Scoring freshness | lag > 30 min for 15 min | project owner |
 | Service health | `/score` p95 > 2 s or error rate > 5% for 10 min; model fell back to `baseline-rules` | project owner |
 | Input or score drift | PSI > 0.2 on score or `is_unregistered` / `size_delta` for 2 consecutive days | project owner, then Evidently report |
@@ -384,8 +405,13 @@ and pgvector on RDS for ≈ 200 USD/month; that trade-off is kept as an alternat
   in the MediaWiki Action API, ~30-day retention, `maxlag` throttling, no SLA. MediaWiki History
   dumps: monthly TSV without header, two snapshots kept, schema can change without notice to
   this project (temporary-account fields were added in 2025–2026). **Contract on this side:**
-  the quality gate checks schema and volumes on every load; a failed check stops the pipeline
-  instead of producing silent garbage.
+  `validate` checks the raw schema and `quality_check` the volumes, keys and label rate of every
+  batch; a failed check fails the run instead of producing silent garbage. Because the API keeps
+  exactly 30 days, a day must be ingested within 30 days or it is lost; DVC keeps what was
+  collected.
+- **Downstream: Lab 4 serving.** **Contract:** the `features` table (one row per edit,
+  `feature_version` column) and the MLflow model `ukwiki-patrol` loaded by alias `champion`;
+  a model is only valid for the `feature_version` it was trained on (run tag).
 - **Downstream: patrollers** via the queue page and the agent. **Contract:** `POST /score` and
   `GET /queue` return the fields in F3–F4; scores are calibrated probabilities; 10-minute p95
   freshness; recommendations only, never actions. `model_version` tells the consumer when the
@@ -397,9 +423,9 @@ and pgvector on RDS for ≈ 200 USD/month; that trade-off is kept as an alternat
 
 | Risk | Mitigation |
 |---|---|
-| Revert ≠ vandalism: edit wars, good-faith mistakes and reverts of experienced editors are positives too | Name the target "revert risk", not "vandalism"; manually check 100 top-scored edits in Lab 2; patroller feedback overrides labels |
+| Revert ≠ vandalism: edit wars, good-faith mistakes and reverts of experienced editors are positives too | Name the target "revert risk", not "vandalism"; manually check 100 top-scored edits before Lab 4; patroller feedback overrides labels |
 | Labels right-censored for 7 days | Maturity window; label metrics only on matured days; re-collect D-8 daily |
-| Two label definitions (tag vs identity revert) disagree | Measure overlap on common dates in Lab 2; keep `label_definition`; train on one definition per run |
+| Two label definitions (tag vs identity revert) disagree | Measure overlap once the dumps are loaded; keep `label_definition`; train on one definition per run |
 | Training-serving skew on user features: dumps give the edit count at edit time, the API gives it now | Serve `user_prior_edits` from the PostgreSQL counter, never from API `editcount`; Lab 4 compares served vs recomputed features daily |
 | Schema change upstream (IP → temporary accounts) | Merge into `is_unregistered`; schema checks in the quality gate; recent-era check in 5.4 |
 | Bursty vandal waves dominate a week of labels (2026-09-28) | Cap examples per user per day in training; alert on flag share |
